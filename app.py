@@ -148,6 +148,18 @@ COLL_ID = "NASA/GDDP-CMIP6"
 
 # Default project - change this to your project ID
 DEFAULT_PROJECT = "axial-edition-469618-t6"
+try:
+    # Allow overriding via environment or Streamlit secrets
+    _env_proj = os.environ.get("EE_PROJECT")
+    if _env_proj:
+        DEFAULT_PROJECT = _env_proj
+    elif hasattr(st, "secrets"):
+        if "EE_PROJECT" in st.secrets:
+            DEFAULT_PROJECT = st.secrets["EE_PROJECT"]
+        elif "gcp_service_account" in st.secrets:
+            DEFAULT_PROJECT = st.secrets["gcp_service_account"].get("project_id", DEFAULT_PROJECT)
+except Exception:
+    pass
 
 
 def search_location(query: str) -> Tuple[float, float, str] | None:
@@ -326,9 +338,18 @@ def ui_sidebar():
     st.sidebar.title("🌍 Climate Data Downloader")
     st.sidebar.markdown("**NASA/GDDP-CMIP6** • Bias-corrected & Downscaled")
     
-    # Initialize session state for project if not set
+    # Initialize session state for project if not set (prefer secrets/env)
     if "ee_project" not in st.session_state:
-        st.session_state["ee_project"] = DEFAULT_PROJECT
+        proj_guess = os.environ.get("EE_PROJECT")
+        try:
+            if not proj_guess and hasattr(st, "secrets"):
+                if "EE_PROJECT" in st.secrets:
+                    proj_guess = st.secrets["EE_PROJECT"]
+                elif "gcp_service_account" in st.secrets:
+                    proj_guess = st.secrets["gcp_service_account"].get("project_id")
+        except Exception:
+            pass
+        st.session_state["ee_project"] = (proj_guess or DEFAULT_PROJECT)
     
     # Auto-initialize EE on first run
     if "ee_initialized" not in st.session_state:
