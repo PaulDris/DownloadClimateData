@@ -1,4 +1,6 @@
 import os
+import json
+import tempfile
 import requests
 from typing import List, Tuple
 
@@ -202,23 +204,100 @@ def get_location_name(lat: float, lon: float) -> str:
 
 
 def _ensure_ee_initialized(project: str) -> Tuple[bool, str]:
-    """Ensure EE is initialized exactly once per session."""
+    """Ensure Earth Engine is initialized once per session, supporting:
+    - Local dev: existing OAuth or interactive ee.Authenticate()
+    - Streamlit Cloud: service account via st.secrets or env vars
+    Secrets/env supported:
+      - st.secrets["gcp_service_account"]: full SA JSON dict
+      - st.secrets["ee_service_account"], st.secrets["ee_private_key_json"]
+      - EE_SERVICE_ACCOUNT, EE_PRIVATE_KEY_JSON env vars
+      - Optional project override via EE_PROJECT env var
+    """
     if ee is None:
         return False, "ee not installed"
-    
-    # Check if already initialized in this session
-    if "ee_initialized" in st.session_state and st.session_state["ee_initialized"]:
+
+    # Already initialized
+    if st.session_state.get("ee_initialized"):
         return True, "already initialized"
-    
-    try:
-        if project and project.strip():
-            ee.Initialize(project=project.strip())
+
+    project = (os.environ.get("EE_PROJECT") or project or "").strip()
+    if not project:
+        return False, "Please specify a Cloud Project"
+
+    # Helper: try initializing with given credentials
+    def _try_init_with_credentials(credentials_obj=None) -> Tuple[bool, str]:
+        try:
+            if credentials_obj is not None:
+                ee.Initialize(credentials_obj, project=project)
+            else:
+                ee.Initialize(project=project)
             st.session_state["ee_initialized"] = True
             return True, "initialized successfully"
-        else:
-            return False, "Please specify a Cloud Project"
+        except Exception as e:
+            return False, str(e)
+
+    # 1) If we already have cached local OAuth creds, this will succeed directly
+    ok, msg = _try_init_with_credentials(None)
+    if ok:
+        return True, "initialized with existing credentials"
+
+    # 2) Try service account from Streamlit secrets or environment
+    sa_email = None
+    key_json_text = None
+    try:
+        # Preferred: full JSON dict under secrets.gcp_service_account
+        if hasattr(st, "secrets") and "gcp_service_account" in st.secrets:
+            sa_dict = dict(st.secrets["gcp_service_account"])  # copy in case it's a Secrets object
+            sa_email = sa_dict.get("client_email")
+            key_json_text = json.dumps(sa_dict)
+        # Alternate: explicit keys in secrets
+        elif hasattr(st, "secrets") and (
+            "ee_service_account" in st.secrets and "ee_private_key_json" in st.secrets
+        ):
+            sa_email = st.secrets["ee_service_account"]
+            key_json_text = st.secrets["ee_private_key_json"]
+        # Environment variables (useful for local Docker or CI)
+        elif os.environ.get("EE_SERVICE_ACCOUNT") and os.environ.get("EE_PRIVATE_KEY_JSON"):
+            sa_email = os.environ.get("EE_SERVICE_ACCOUNT")
+            key_json_text = os.environ.get("EE_PRIVATE_KEY_JSON")
+    except Exception:
+        pass
+
+    if sa_email and key_json_text:
+        try:
+            # Write JSON to a temporary file (ee.ServiceAccountCredentials expects a path)
+            with tempfile.NamedTemporaryFile("w", delete=False, suffix=".json") as tf:
+                tf.write(key_json_text)
+                key_path = tf.name
+            creds = ee.ServiceAccountCredentials(sa_email, key_path)
+            ok, msg = _try_init_with_credentials(creds)
+            # Clean up temp file if desired; keep for the session in case of lazy refresh
+            try:
+                os.unlink(key_path)
+            except Exception:
+                pass
+            if ok:
+                return True, f"initialized with service account {sa_email}"
+        except Exception as e:
+            # Fall through to next options
+            last_sa_err = str(e)
+    else:
+        last_sa_err = "no service account credentials provided"
+
+    # 3) On Streamlit Cloud, interactive OAuth is not possible
+    running_on_streamlit_cloud = bool(os.environ.get("STREAMLIT_SERVER_ENABLED") or os.environ.get("STREAMLIT_RUNTIME"))
+    if running_on_streamlit_cloud:
+        return False, f"Streamlit deploy requires a service account. {last_sa_err}"
+
+    # 4) Local fallback: prompt OAuth
+    try:
+        ee.Authenticate()
+        ok, msg = _try_init_with_credentials(None)
+        if ok:
+            return True, "authenticated via OAuth"
+        return False, msg
     except Exception as e:
-        return False, str(e)
+        return False, f"OAuth failed and no service account available: {e}"
 
 
 def _init_ee(project: str | None = None) -> Tuple[bool, str]:
